@@ -221,12 +221,92 @@ kill -TERM <PID> ...
 
 ## 9. Performance Benchmarks
 
-- **Tool**: `vllm bench serve` in the venv, `--dataset-name random`, `--endpoint /v1/completions`
-- **Measurement setup**: **input 8192 / output 1** (pure-prefill throughput, matching the repo's committed setup), 128 prompts, `--request-rate inf`, `--ignore-eos`, `temperature 0`, `--seed 42`
-- **Concurrency sweep**: `1 2 4 8 16 32 64` (`CONCURRENCIES`)
-- **Results**: `scripts/bench_all.sh` writes per-concurrency JSON to `runs/manual-*/results/dp8/` and an aggregated `summary.json` alongside them
+### 9.1 Measurement setup
 
-### 9.1 DP8 measured results (2026-07-26)
+- **Tool**: `vllm bench serve` (in the venv), `--dataset-name random`, `--endpoint /v1/completions`, `--random-range-ratio 0` (fixed length), `--ignore-eos --temperature 0 --seed 42`, `--request-rate inf`.
+- **Harness**: `scripts/bench_matrix.sh` (torch-tpu) and `scripts/bench_matrix_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `JAX.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
+- **Raw JSON**: `results/torch-tpu/` (this backend), `results/jax/` (JAX). Filenames: `in<INPUT>_out<OUTPUT>_c<CONCURRENCY>.json`.
+- **Workloads**:
+
+| Load | input / output | Character |
+|------|----------------|-----------|
+| A | 1024 / 1024 | balanced |
+| B | 1024 / 8192 | decode-heavy |
+| C | 8192 / 1024 | prefill-heavy (mixed) |
+| D | 1024 / 1 | short pure-prefill |
+| E | 8192 / 1 | long pure-prefill (the repo's headline metric) |
+
+### 9.2 Measured results (torch-tpu DP8)
+
+DP8 server (`scripts/start_dp_server.sh`, DP=8 / TP=1 / EP, port 18100), all five workloads swept over concurrency:
+
+**Workload A — 1024 / 1024 (balanced)**
+
+| Concurrency | Total tok/s | Output tok/s | Req/s | Mean TTFT (ms) | Mean TPOT (ms) |
+|-------------|------------|--------------|-------|----------------|----------------|
+| 1 | 100 | 50 | 0.05 | 860 | 19.2 |
+| 2 | 192 | 96 | 0.09 | 990 | 19.9 |
+| 4 | 384 | 192 | 0.19 | 873 | 20.0 |
+| 8 | 764 | 382 | 0.37 | 1,612 | 19.4 |
+| 16 | 1,516 | 758 | 0.74 | 1,654 | 19.5 |
+| 32 | 2,604 | 1,302 | 1.27 | 1,582 | 23.0 |
+| **64** | **3,607** | 1,803 | 1.76 | 2,101 | 32.8 |
+
+**Workload B — 1024 / 8192 (decode-heavy)**
+
+| Concurrency | Total tok/s | Output tok/s | Req/s | Mean TTFT (ms) | Mean TPOT (ms) |
+|-------------|------------|--------------|-------|----------------|----------------|
+| 4 | 224 | 199 | 0.02 | 870 | 20.0 |
+| 8 | 526 | 468 | 0.06 | 1,523 | 16.9 |
+| 16 | 939 | 835 | 0.10 | 1,665 | 19.0 |
+| 32 | 1,502 | 1,335 | 0.16 | 1,627 | 23.8 |
+| **64** | **2,488** | 2,211 | 0.27 | 2,011 | 28.7 |
+
+**Workload C — 8192 / 1024 (prefill-heavy, mixed)**
+
+| Concurrency | Total tok/s | Output tok/s | Req/s | Mean TTFT (ms) | Mean TPOT (ms) |
+|-------------|------------|--------------|-------|----------------|----------------|
+| 1 | 437 | 49 | 0.05 | 1,802 | 18.8 |
+| 2 | 861 | 96 | 0.09 | 1,808 | 19.2 |
+| 4 | 1,571 | 175 | 0.17 | 2,472 | 20.5 |
+| 8 | 3,721 | 413 | 0.40 | 2,158 | 17.3 |
+| 16 | 6,236 | 693 | 0.68 | 2,760 | 20.4 |
+| 32 | 9,463 | 1,051 | 1.03 | 4,741 | 25.8 |
+| **64** | **14,147** | 1,572 | 1.54 | 5,902 | 34.9 |
+
+**Workload D — 1024 / 1 (pure prefill, short input)**
+
+| Concurrency | Total tok/s | Req/s | Mean TTFT (ms) | p99 TTFT (ms) |
+|-------------|------------|-------|----------------|---------------|
+| 1 | 1,197 | 1.17 | 856 | 878 |
+| 2 | 1,486 | 1.45 | 1,326 | 1,693 |
+| 4 | 4,817 | 4.70 | 851 | 860 |
+| 8 | 3,960 | 3.86 | 1,653 | 2,352 |
+| 16 | 6,740 | 6.58 | 1,675 | 2,439 |
+| 32 | 13,780 | 13.44 | 1,656 | 2,412 |
+| **64** | **25,983** | 25.35 | 2,005 | 2,977 |
+
+**Workload E — 8192 / 1 (pure prefill, long input; repo headline)**
+
+| Concurrency | Total tok/s | Req/s | Mean TTFT (ms) | p99 TTFT (ms) |
+|-------------|------------|-------|----------------|---------------|
+| 1 | 4,567 | 0.56 | 1,794 | 1,804 |
+| 2 | 9,167 | 1.12 | 1,787 | 1,807 |
+| 4 | 12,972 | 1.58 | 2,473 | 2,596 |
+| 8 | 29,858 | 3.64 | 2,148 | 2,254 |
+| 16 | 45,126 | 5.51 | 2,542 | 3,357 |
+| 32 | 45,602 | 5.57 | 4,783 | 6,669 |
+| **64** | **49,934** | 6.09 | 8,346 | 14,032 |
+
+**Observations**
+
+1. **The workload determines the magnitude**: on the same DP8 server, `output=1` (pure prefill) peaks near **50k tok/s**, but with `output≥1024` the total drops sharply to 3.6k–14.1k — once decode begins, each request spends 20 s+ generating tokens one at a time (memory-bound), diluting aggregate token/s. **So the repo's headline figure is a prefill-only number, not end-to-end serving throughput.**
+2. **Stable TPOT**: across all workloads the decode step stays at **17–35 ms**, rising gently with concurrency — no abnormal bottleneck in the decode path.
+3. **Strong prefill, average decode**: Workload C (long input) scales near-linearly to 14k; Workload B (long output) is decode-limited, reaching only 2.5k even at c64 — consistent with torch-tpu's Pallas prefill-kernel advantage.
+
+### 9.3 Reproduction of the repo baseline
+
+The repo's committed metric is **workload E (8192/1, pure prefill)**. `scripts/bench_all.sh` reproduces it under the repo's own口径 (fixed 128 prompts, concurrency sweep):
 
 | Concurrency | Total token throughput (tok/s) | Req/s |
 |-------------|-------------------------------|-------|
@@ -240,126 +320,52 @@ kill -TERM <PID> ...
 
 - **Peak 52,452.7 tok/s @ concurrency 16**, mean TTFT 2.41 s / p99 3.34 s, 128/128 successful.
 
-### 9.2 Comparison against the repo's committed baseline
-
 | Config | This reproduction | Repo baseline (7/17–7/21) | Verdict |
 |--------|-------------------|---------------------------|---------|
-| **dp8** | **52,453 tok/s** | 40,378–49,381 tok/s | ✅ **matches and slightly exceeds the upper bound, no implementation gap** |
-| pcp8 | ❌ did not run (see §9.3) | 34,296 tok/s (revision db5ae0ab) | ⚠️ incompatible on the current HEAD |
+| **dp8** | **52,453 tok/s** | 40,378–49,381 tok/s | ✅ **matches and slightly exceeds the upper bound — no implementation gap** |
+| pcp8 | ❌ did not run (see below) | 34,296 tok/s (revision db5ae0ab) | ⚠️ incompatible on the current HEAD |
 
-### 9.3 PCP8 (DP=1 / PCP=8) incompatibility note
+> The §9.2 workload-E figure (49,934 @ c64) uses the independent harness (`num-prompts=c×2`); `bench_all.sh` above uses a fixed 128 prompts and peaks earlier (52,453 @ c16). Both confirm 8192/1 is stable at **~45–52k tok/s**; the gap is only the num-prompts / peak-concurrency point.
 
-A PCP8 config (DP=1 / PCP=8, i.e. `--data-parallel-size 1 --prefill-context-parallel-size 8`) compiles fine on the current stack (vLLM 0.22.1 + torchtpu-vllm **88f359b**), but the engine fails during initialization — Qwen3.5's hybrid (mamba+attn) KV conflicts with context parallelism:
+**PCP8 (DP=1 / PCP=8) incompatibility** — a PCP8 config (`--data-parallel-size 1 --prefill-context-parallel-size 8`) compiles on the current stack (vLLM 0.22.1 + torchtpu-vllm **88f359b**) but fails during engine init — Qwen3.5's hybrid (mamba+attn) KV conflicts with context parallelism:
 
 | Attempt | Error |
 |---------|-------|
 | hybrid KV **on** (repo's original flag) | `Hybrid KV cache groups with multiple block sizes do not support context parallelism` |
-| hybrid KV **off** (`--disable-hybrid-kv-cache-manager` override) | `Hybrid KV cache manager is disabled but failed to convert the KV cache specs to one unified type` |
+| hybrid KV **off** (`--disable-hybrid-kv-cache-manager`) | `Hybrid KV cache manager is disabled but failed to convert the KV cache specs to one unified type` |
 
-- The repo's pcp8 baseline (34,296) was captured on an **earlier revision `db5ae0ab`**; between then and 88f359b this path was blocked by vLLM's checks.
-- A true pcp8 reproduction requires reverting to `db5ae0ab` (re-fetching that commit + possibly rebuilding the torch-tpu wheel). **This part is pending.**
+The repo's pcp8 baseline (34,296) was captured on an earlier revision `db5ae0ab`; reproducing it requires reverting to that commit (and possibly rebuilding the wheel). **This part is pending.**
 
-### 9.4 Independent test matrix (varied input/output, DP8, 2026-07-27)
+### 9.4 Cross-backend A/B vs JAX (same harness)
 
-§9.1 only reproduces the repo's setup (8192/1, pure prefill). For an independent evaluation, three real workloads × concurrency sweeps were run (independent `vllm bench serve`, same DP8 server, `--random-range-ratio 0` fixed length, `--ignore-eos --temperature 0 --seed 42`, num-prompts scaled with concurrency as `c×2` clamped to [16,128]). Raw JSON is in `results/torch-tpu/` (via `scripts/bench_matrix.sh`).
-
-**Workload A — 1024 / 1024 (balanced)**
-
-| Concurrency | Total tok/s | Output tok/s | Req/s | Mean TTFT (ms) | Mean TPOT (ms) |
-|-------------|------------|--------------|-------|----------------|----------------|
-| 1  | 100      | 50      | 0.05 | 860   | 19.2 |
-| 2  | 192      | 96      | 0.09 | 990   | 19.9 |
-| 4  | 384      | 192     | 0.19 | 873   | 20.0 |
-| 8  | 764      | 382     | 0.37 | 1,612 | 19.4 |
-| 16 | 1,516    | 758     | 0.74 | 1,654 | 19.5 |
-| 32 | 2,604    | 1,302   | 1.27 | 1,582 | 23.1 |
-| **64** | **3,607** | 1,803 | 1.76 | 2,101 | 32.8 |
-
-**Workload B — 1024 / 8192 (decode-heavy)**
-
-| Concurrency | Total tok/s | Output tok/s | Req/s | Mean TTFT (ms) | Mean TPOT (ms) |
-|-------------|------------|--------------|-------|----------------|----------------|
-| 4  | 224    | 199   | 0.02 | 870   | 20.0 |
-| 8  | 526    | 468   | 0.06 | 1,523 | 16.9 |
-| 16 | 939    | 835   | 0.10 | 1,665 | 19.0 |
-| 32 | 1,502  | 1,335 | 0.16 | 1,627 | 23.8 |
-| **64** | **2,488** | 2,211 | 0.27 | 2,011 | 28.7 |
-
-**Workload C — 8192 / 1024 (prefill-heavy, comparable to the JAX report's 8k/1k)**
-
-| Concurrency | Total tok/s | Output tok/s | Req/s | Mean TTFT (ms) | Mean TPOT (ms) |
-|-------------|------------|--------------|-------|----------------|----------------|
-| 1  | 437     | 49    | 0.05 | 1,802 | 18.8 |
-| 2  | 861     | 96    | 0.09 | 1,808 | 19.2 |
-| 4  | 1,571   | 175   | 0.17 | 2,472 | 20.5 |
-| 8  | 3,721   | 413   | 0.40 | 2,158 | 17.3 |
-| 16 | 6,236   | 693   | 0.68 | 2,760 | 20.4 |
-| 32 | 9,463   | 1,051 | 1.03 | 4,741 | 25.8 |
-| **64** | **14,147** | 1,572 | 1.54 | 5,902 | 34.9 |
-
-**Workload D — 1024 / 1 (pure prefill, short input)**
-
-| Concurrency | Total tok/s | Req/s | Mean TTFT (ms) | p99 TTFT (ms) |
-|-------------|------------|-------|----------------|---------------|
-| 1  | 1,197   | 1.17  | 856   | 878   |
-| 2  | 1,486   | 1.45  | 1,326 | 1,693 |
-| 4  | 4,817   | 4.70  | 851   | 860   |
-| 8  | 3,960   | 3.86  | 1,653 | 2,352 |
-| 16 | 6,740   | 6.58  | 1,675 | 2,439 |
-| 32 | 13,780  | 13.44 | 1,656 | 2,412 |
-| **64** | **25,983** | 25.35 | 2,005 | 2,977 |
-
-**Workload E — 8192 / 1 (pure prefill, repo setup, independent harness)**
-
-| Concurrency | Total tok/s | Req/s | Mean TTFT (ms) | p99 TTFT (ms) |
-|-------------|------------|-------|----------------|---------------|
-| 1  | 4,567   | 0.56  | 1,794 | 1,804  |
-| 2  | 9,167   | 1.12  | 1,787 | 1,807  |
-| 4  | 12,972  | 1.58  | 2,473 | 2,596  |
-| 8  | 29,858  | 3.64  | 2,148 | 2,254  |
-| 16 | 45,126  | 5.51  | 2,542 | 3,357  |
-| 32 | 45,602  | 5.57  | 4,784 | 6,669  |
-| **64** | **49,934** | 6.09 | 8,346 | 14,032 |
-
-> Workload E (8192/1) is the repo's setup, but here it uses the **independent harness** (num-prompts=`c×2`, not §9.1's fixed 128). Peak **49,934 tok/s @ c64**, same order of magnitude as §9.1 (bench_all with a fixed 128 prompts, 52,453 @ c16); the difference comes from different num-prompts and peak-concurrency points — at c16 here num-prompts=32 doesn't fill the pipeline, so §9.1's c16 is higher. **Both confirm 8192/1 is stable at ~45–52k.**
-
-**Observations**
-
-1. **The setup determines the magnitude**: on the same DP8 server, `output=1` (pure prefill) peaks at **52,453 tok/s**, but with `output≥1024` the total drops sharply to 3.6k–14.1k — because once decode begins, each request spends 20 s+ generating tokens one at a time (memory-bound), diluting the aggregate token/s. **So the repo's 52k is a prefill-only figure and should not be read as end-to-end serving throughput.**
-2. **Stable TPOT**: across all workloads the decode step stays at **17–35 ms**, rising gently with concurrency — no abnormal bottleneck in the decode path.
-3. **Strong prefill, average decode**: Workload C (long input) scales near-linearly with concurrency to 14k; Workload B (long output) is decode-limited, reaching only 2.5k even at concurrency 64. This is consistent with torch-tpu's Pallas prefill-kernel advantage.
-
-### 9.5 Same-workload comparison against the JAX backend (controlled A/B)
-
-**Controlled A/B (2026-07-28)**: the JAX backend (port 8000, `run_vllm.sh`, TP=8, committed config) was re-run with the **exact same harness as torch-tpu** (`bench_matrix_jax.sh`, same num-prompts / seed / parameters); the JAX raw JSON is in `results/jax/`. The peak point (c64) for each workload:
+The JAX backend (port 8000, `run_vllm.sh`, TP=8) was run with the **exact same harness** (`bench_matrix_jax.sh`, identical num-prompts / seed / parameters); raw JSON in `results/jax/`. Peak point (c64) per workload:
 
 | Workload (in/out) | Type | torch-tpu | JAX | c64 winner |
 |-------------------|------|-----------|-----|------------|
-| 1024 / 1   | pure prefill (short) | 25,983 | **41,448** | JAX ↑ ~60% |
-| 8192 / 1   | pure prefill (long)  | **49,934** (§9.1 52,453) | 44,651 | **torch-tpu ↑ ~12%** |
-| 1024 / 1024 | balanced | **3,607** | 3,498 | tie (torch-tpu ↑ ~3%) |
+| 1024 / 1 | pure prefill (short) | 25,983 | **41,448** | JAX ↑ ~60% |
+| 8192 / 1 | pure prefill (long) | **49,934** | 44,651 | **torch-tpu ↑ ~12%** |
+| 1024 / 1024 | balanced | **3,607** | 3,498 | ~tie (torch-tpu ↑ ~3%) |
 | 1024 / 8192 | decode-heavy | 2,488 | **2,811** | JAX ↑ ~13% |
-| 8192 / 1024 | prefill-heavy (with decode) | 14,147 | **20,020** | JAX ↑ ~42% |
-
-> **Harness self-check**: the same-harness JAX 8192/1024 = 20,020 tok/s, nearly identical to the JAX report §9.1 doc value of 19,836 (1024/8192: report 2,852 vs measured 2,811; 1024/1024: report 4,410 vs measured 3,498 — the latter difference comes from num-prompts, as the report used a larger fixed batch). This shows the controlled re-run is comparable to the original JAX report's setup, so the table above is a **true controlled A/B** that supersedes the earlier doc-value comparison.
+| 8192 / 1024 | prefill+decode mixed | 14,147 | **20,020** | JAX ↑ ~42% |
 
 **Pure-prefill, per concurrency (total tok/s)**
 
 | Concurrency | 1024/1 torch-tpu | 1024/1 JAX | 8192/1 torch-tpu | 8192/1 JAX |
 |-------------|------------------|------------|------------------|------------|
-| 1  | 1,197  | 3,496  | 4,567  | 5,973  |
-| 2  | 1,486  | 5,280  | 9,167  | 9,759  |
-| 4  | 4,817  | 7,995  | 12,972 | 19,116 |
-| 8  | 3,960  | 22,134 | 29,858 | 35,255 |
-| 16 | 6,740  | 35,759 | 45,126 | 38,827 |
+| 1 | 1,197 | 3,496 | 4,567 | 5,973 |
+| 2 | 1,486 | 5,280 | 9,167 | 9,759 |
+| 4 | 4,817 | 7,995 | 12,972 | 19,116 |
+| 8 | 3,960 | 22,134 | 29,858 | 35,255 |
+| 16 | 6,740 | 35,759 | 45,126 | 38,827 |
 | 32 | 13,780 | 37,610 | 45,602 | 43,395 |
 | 64 | 25,983 | 41,448 | 49,934 | 44,651 |
 
-**Conclusions (controlled A/B, c64)**
-- **torch-tpu wins only on "long-input pure prefill"** (8192/1, +12%); on the balanced workload (1024/1024) it is essentially a tie (+3%).
-- **JAX leads in every other scenario**: short-input pure prefill (1024/1, +60%), decode-heavy (1024/8192, +13%), and prefill+decode mixed (8192/1024, +42%).
-- Key contrast: torch-tpu's **8192/1 pure prefill beats JAX**, but once decode is added to the same long input (8192/1024), **JAX wins by 42%** — torch-tpu's strength is concentrated in the prefill kernel, while its decode path (especially mixed with long prefill) is less mature than JAX's.
-- Any cross-backend conclusion must be anchored to "input length + whether decode is involved"; the repo's single 8192/1 52k point is not representative on its own.
+**Conclusions (c64)**
+
+- **torch-tpu wins only on long-input pure prefill** (8192/1, +12%); on the balanced workload (1024/1024) it is essentially a tie (+3%).
+- **JAX leads everywhere else**: short-input pure prefill (1024/1, +60%), decode-heavy (1024/8192, +13%), and prefill+decode mixed (8192/1024, +42%).
+- Key contrast: torch-tpu's 8192/1 pure prefill beats JAX, but once decode is added to the same long input (8192/1024) **JAX wins by 42%** — torch-tpu's strength is concentrated in the prefill kernel, while its decode path (mixed with long prefill) is less mature than JAX's.
+- Any cross-backend conclusion must be anchored to "input length + whether decode is involved"; the single 8192/1 headline point is not representative on its own.
 
 ---
 

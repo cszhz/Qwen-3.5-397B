@@ -12,7 +12,7 @@ vLLM, across two independent TPU backends.
 | [`JAX.md`](JAX.md) | **tpu_inference** — JAX (Docker, port 8000, TP=8 + attention DP + MoE EP) | Docker deployment, serving config, and benchmarks |
 
 Both backends drive the same 4 TPU chips, so only one can run at a time; the A/B
-in `torch-tpu.md` §9.5 was measured by stopping one and bringing up the other
+in `torch-tpu.md` §9.4 (and mirrored in `JAX.md` §9.4) was measured by stopping one and bringing up the other
 under an identical harness.
 
 ## Scripts
