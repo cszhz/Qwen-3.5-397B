@@ -186,7 +186,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 - **Tool**: `vllm bench serve` inside the container (same source as the recipe's benchmark_serving), `--dataset-name random`
 - **Target**: the real-weights service deployed here (`localhost:8000`, concurrency=64=`max-num-seqs`, `--ignore-eos`, `--request-rate inf`, `--seed 42`)
-- **Result JSON**: `/data/red_poc/runs/bench_*.json`
+- **Result JSON**: raw per-workload JSON in `results/jax/` (produced by `scripts/bench_matrix_jax.sh`)
 
 ### 9.1 Measured results
 
@@ -210,7 +210,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 - All three workloads had **0 failures**, with stable TPOT/ITL (P99 ≈ mean) and healthy latency.
 - **Improvement direction**: raise `--max-num-seqs` to 128 and re-test at concurrency 128 to approach the official decode throughput (note: changing this parameter triggers a one-time ~70 min recompile due to the new num_reqs bucket).
 
-> Note: the `daily_benchmark.sh` provided is designed for a separate **torch-tpu (native PyTorch PrivateUse1, not torch_xla) + dummy weights + DP8/PCP8** path (it depends on `third_party/torchtpu-vllm`, `start_dp_server.sh`, and other repo scripts) and cannot be used directly for this Docker/JAX deployment. The results above were instead measured against the real-weights service using vLLM's built-in `bench serve`. A full controlled A/B between this JAX backend and the torch-tpu backend (same harness, all 5 workloads) is documented in `torch-tpu.md` §9.5.
+> Note: the torch-tpu DP8 harness (`scripts/start_dp_server.sh` + `scripts/bench_all.sh`, dummy weights, port 18100) is a separate path and cannot be used for this Docker/JAX deployment. The results above were measured against the real-weights JAX service using vLLM's built-in `bench serve`. A full controlled A/B between this JAX backend and the torch-tpu backend (same harness, all 5 workloads) is documented in `torch-tpu.md` §9.5.
 
 ---
 

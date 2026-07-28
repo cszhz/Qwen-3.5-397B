@@ -97,14 +97,21 @@ uv pip install --python .venv/bin/python -e /data/red_poc/torchtpu-vllm   # inst
 uv pip check                                                              # passes
 ```
 
-### 3.5 Wire into the repo scripts (bypassing the GAR-dependent update_environment.sh)
+### 3.5 Wire up the launcher paths
+
+The launcher (`scripts/start_dp_server.sh`) self-locates its paths relative to the repo
+root. Make the plugin source and the model metadata discoverable:
 
 ```bash
-ln -s /data/red_poc/torchtpu-vllm $REPO/third_party/torchtpu-vllm
-ln -s <real model dir> models/Qwen3.5-397B-A17B-FP8   # provides config.json / tokenizer.json
+# vllm_torchtpu plugin source (only needed if not relying on the editable install)
+ln -s <your torchtpu-vllm checkout> third_party/torchtpu-vllm
+# model metadata (config.json / tokenizer.json); dummy weights are generated at load time
+ln -s <real model dir> models/Qwen3.5-397B-A17B-FP8
 ```
 
-> `scripts/update_environment.sh` pulls torch/torch-tpu from GAR; this reproduction **skips it** and uses the local wheel + editable installs above instead.
+> There is **no GAR step**: the environment is built entirely from §3.1–3.4 (source wheel +
+> editable installs from public PyPI). All launcher paths (`VENV_DIR`, `TORCHTPU_DIR`,
+> `MODEL_DIR`, `PORT`, …) are overridable via environment variables.
 
 ---
 
@@ -163,8 +170,8 @@ ln -s <real model dir> models/Qwen3.5-397B-A17B-FP8   # provides config.json / t
 ### 5.3 Launch
 
 ```bash
-cd $REPO
-nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
+# from the repo root
+nohup ./scripts/start_dp_server.sh > dp8_server.log 2>&1 &
 # Wait for: curl http://127.0.0.1:18100/health → 200
 ```
 
@@ -197,17 +204,17 @@ nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
 ## 8. Operations Commands
 
 ```bash
-# Start the DP8 server
-cd $REPO && nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
-tail -f /data/red_poc/dp8_server.log                 # view logs / compile progress
+# Start the DP8 server (run from the repo root)
+nohup ./scripts/start_dp_server.sh > dp8_server.log 2>&1 &
+tail -f dp8_server.log                               # view logs / compile progress
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18100/health   # health check
 
 # Stop the server (⚠️ stop by PID; do NOT use pkill -f api_server — it matches the command's own cmdline and kills the shell)
 ps -eo pid,cmd | grep -E 'vllm.entrypoints|EngineCore' | grep -v grep    # find PIDs
 kill -TERM <PID> ...
 
-# Run the benchmark (no git publish)
-PUBLISH_REPORTS=0 ./scripts/bench_all.sh
+# Run the headline benchmark (8192/1 prefill, concurrency sweep) -> writes summary.json
+./scripts/bench_all.sh
 ```
 
 ---
@@ -217,7 +224,7 @@ PUBLISH_REPORTS=0 ./scripts/bench_all.sh
 - **Tool**: `vllm bench serve` in the venv, `--dataset-name random`, `--endpoint /v1/completions`
 - **Measurement setup**: **input 8192 / output 1** (pure-prefill throughput, matching the repo's committed setup), 128 prompts, `--request-rate inf`, `--ignore-eos`, `temperature 0`, `--seed 42`
 - **Concurrency sweep**: `1 2 4 8 16 32 64` (`CONCURRENCIES`)
-- **Results**: `runs/manual-*/results/dp8/*.json`; aggregated into `reports/latest.json`
+- **Results**: `scripts/bench_all.sh` writes per-concurrency JSON to `runs/manual-*/results/dp8/` and an aggregated `summary.json` alongside them
 
 ### 9.1 DP8 measured results (2026-07-26)
 
@@ -242,7 +249,7 @@ PUBLISH_REPORTS=0 ./scripts/bench_all.sh
 
 ### 9.3 PCP8 (DP=1 / PCP=8) incompatibility note
 
-`scripts/start_pcp_server.sh` compiles fine on the current stack (vLLM 0.22.1 + torchtpu-vllm **88f359b**), but the engine fails during initialization — Qwen3.5's hybrid (mamba+attn) KV conflicts with context parallelism:
+A PCP8 config (DP=1 / PCP=8, i.e. `--data-parallel-size 1 --prefill-context-parallel-size 8`) compiles fine on the current stack (vLLM 0.22.1 + torchtpu-vllm **88f359b**), but the engine fails during initialization — Qwen3.5's hybrid (mamba+attn) KV conflicts with context parallelism:
 
 | Attempt | Error |
 |---------|-------|
@@ -254,7 +261,7 @@ PUBLISH_REPORTS=0 ./scripts/bench_all.sh
 
 ### 9.4 Independent test matrix (varied input/output, DP8, 2026-07-27)
 
-§9.1 only reproduces the repo's setup (8192/1, pure prefill). For an independent evaluation, three real workloads × concurrency sweeps were run (independent `vllm bench serve`, same DP8 server, `--random-range-ratio 0` fixed length, `--ignore-eos --temperature 0 --seed 42`, num-prompts scaled with concurrency as `c×2` clamped to [16,128]). Raw JSON is in `/data/red_poc/matrix_results/`.
+§9.1 only reproduces the repo's setup (8192/1, pure prefill). For an independent evaluation, three real workloads × concurrency sweeps were run (independent `vllm bench serve`, same DP8 server, `--random-range-ratio 0` fixed length, `--ignore-eos --temperature 0 --seed 42`, num-prompts scaled with concurrency as `c×2` clamped to [16,128]). Raw JSON is in `results/torch-tpu/` (via `scripts/bench_matrix.sh`).
 
 **Workload A — 1024 / 1024 (balanced)**
 
@@ -324,7 +331,7 @@ PUBLISH_REPORTS=0 ./scripts/bench_all.sh
 
 ### 9.5 Same-workload comparison against the JAX backend (controlled A/B)
 
-**Controlled A/B (2026-07-28)**: the JAX backend (port 8000, `run_vllm.sh`, TP=8, committed config) was re-run with the **exact same harness as torch-tpu** (`bench_matrix_jax.sh`, same num-prompts / seed / parameters); the JAX raw JSON is in `/data/red_poc/matrix_results_jax/`. The peak point (c64) for each workload:
+**Controlled A/B (2026-07-28)**: the JAX backend (port 8000, `run_vllm.sh`, TP=8, committed config) was re-run with the **exact same harness as torch-tpu** (`bench_matrix_jax.sh`, same num-prompts / seed / parameters); the JAX raw JSON is in `results/jax/`. The peak point (c64) for each workload:
 
 | Workload (in/out) | Type | torch-tpu | JAX | c64 winner |
 |-------------------|------|-----------|-----|------------|
@@ -371,5 +378,5 @@ PUBLISH_REPORTS=0 ./scripts/bench_all.sh
 
 - **PCP8 deep reproduction**: fetch `db5ae0ab` + rebuild the matching torch-tpu → run the 8192/1 sweep, filling in the pcp8 comparison (requires the PAT).
 - **Independent test matrix**: ✅ done (see §9.4, 3 workloads × concurrency sweep).
-- **Strict cross-backend A/B**: ✅ done (2026-07-28, see §9.5). The JAX backend (port 8000, committed config) was run with the same harness across all 5 workloads including pure prefill; result JSON is in `/data/red_poc/matrix_results_jax/`. Harness self-check passed (JAX 8192/1024 measured 20,020 ≈ report's 19,836).
+- **Strict cross-backend A/B**: ✅ done (2026-07-28, see §9.5). The JAX backend (port 8000, committed config) was run with the same harness across all 5 workloads including pure prefill; result JSON is in `results/jax/`. Harness self-check passed (JAX 8192/1024 measured 20,020 ≈ report's 19,836).
 - Validate accuracy + throughput with real weights (dropping `--load-format dummy`).

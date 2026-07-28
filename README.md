@@ -17,11 +17,17 @@ under an identical harness.
 
 ## Scripts
 
-| Script | Purpose |
-|--------|---------|
-| [`scripts/run_vllm.sh`](scripts/run_vllm.sh) | Launch the JAX (`tpu_inference`) Docker backend. Set `HF_TOKEN` before running. |
-| [`scripts/bench_matrix.sh`](scripts/bench_matrix.sh) | Independent benchmark matrix (5 workloads × concurrency sweep) against the torch-tpu server (port 18100). |
-| [`scripts/bench_matrix_jax.sh`](scripts/bench_matrix_jax.sh) | Same harness against the JAX server (port 8000). |
+All scripts are self-contained (self-locating paths, env-overridable); nothing points to an external repo checkout.
+
+| Script | Backend | Purpose |
+|--------|---------|---------|
+| [`scripts/start_dp_server.sh`](scripts/start_dp_server.sh) | torch-tpu | Launch the DP8 server (DP=8/TP=1/EP, port 18100). |
+| [`scripts/bench_all.sh`](scripts/bench_all.sh) | torch-tpu | Headline benchmark: `vllm bench serve` concurrency sweep at a fixed length (default 8192/1), writes `summary.json`. |
+| [`scripts/bench_matrix.sh`](scripts/bench_matrix.sh) | torch-tpu | Independent benchmark matrix (5 workloads × concurrency sweep), port 18100. |
+| [`scripts/run_vllm.sh`](scripts/run_vllm.sh) | JAX | Launch the `tpu_inference` Docker backend (port 8000). Set `HF_TOKEN` before running. |
+| [`scripts/bench_matrix_jax.sh`](scripts/bench_matrix_jax.sh) | JAX | Same matrix harness against the JAX server (port 8000). |
+
+Set `REPO=/path/to/this/checkout` (used by `bench_matrix*.sh`); the server/bench scripts otherwise self-locate to the repo root.
 
 ## Raw results
 
