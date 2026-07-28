@@ -3,7 +3,7 @@
 # 直接调用 vllm bench serve,结果存 /data/red_poc/matrix_results,不覆盖复现报告。
 set -u
 
-PROJ=/data/red_poc/tpu_benchmark_daily
+PROJ="${REPO:?set REPO to your checkout root}"
 VENV=$PROJ/.venv
 MODEL_DIR=$PROJ/models/Qwen3.5-397B-A17B-FP8
 SERVED=Qwen3.5-397B-A17B-FP8

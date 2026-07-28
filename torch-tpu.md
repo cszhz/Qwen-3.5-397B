@@ -1,7 +1,7 @@
 # Qwen3.5-397B-A17B-FP8 on Ironwood TPU — torch-tpu Backend Benchmark
 
 - **Report date**: 2026-07-26
-- **Goal**: Rebuild the `tpu_benchmark_daily` repo's **torch-tpu (native PyTorch PrivateUse1 backend)** throughput benchmark from scratch on this machine, **without** the private Google Artifact Registry (GAR), and verify whether the repo's committed DP8 / PCP8 results reproduce.
+- **Goal**: Rebuild the **torch-tpu (native PyTorch PrivateUse1 backend)** throughput benchmark from scratch on this machine, **without** the private Google Artifact Registry (GAR), and verify whether the committed DP8 / PCP8 baselines reproduce.
 - **Verdict**: ✅ **DP8 fully reproduced** (peak 52,452 tok/s, slightly above the repo baseline of 40k–49k); ⚠️ **PCP8 cannot run on the current torchtpu-vllm HEAD** due to an architectural incompatibility (the baseline was captured on an earlier revision).
 - **Relation to the JAX backend**: This is a **completely independent** deployment path. The JAX `tpu_inference` backend (Docker, port 8000) is documented in `JAX.md`; this document covers the torch-tpu native backend (built from source, port 18100). The two use different measurement setups (see §9).
 
@@ -40,7 +40,7 @@ This path uses **torch-tpu** (Google's native PyTorch TPU backend: PrivateUse1 d
 |------|-------|
 | Model | `Qwen3.5-397B-A17B-FP8` |
 | Architecture | `Qwen3_5MoeForConditionalGeneration` (hybrid: 15 full-attn layers + 45 linear-attn/mamba layers; 512 experts, top-10; 397B / ~17B active) |
-| Local path | `/data/red_poc/tpu_benchmark_daily/models/Qwen3.5-397B-A17B-FP8` |
+| Local path | `$REPO/models/Qwen3.5-397B-A17B-FP8` |
 | **Weight loading** | **dummy (random weights)** — the benchmark measures throughput only, not accuracy |
 
 > The benchmark uses `--load-format dummy`, loading only config/tokenizer; the real 379 GiB weights are not needed.
@@ -50,6 +50,8 @@ This path uses **torch-tpu** (Google's native PyTorch TPU backend: PrivateUse1 d
 ## 3. Reproduction Steps (no private GAR)
 
 Core idea: every pin except `torch-tpu` comes from public PyPI; `torch-tpu` is built from source, with its version string reproduced exactly via `WHEEL_VERSION_EXTRAS` → guaranteeing ABI alignment with `torchtpu-vllm`.
+
+> Throughout, `$REPO` denotes your local checkout root (the directory holding `scripts/`, `third_party/`, `models/`, etc.). Set it once, e.g. `export REPO=/path/to/your/checkout`.
 
 ### 3.1 Install system dependencies (needed for bare-metal vLLM build)
 
@@ -87,7 +89,7 @@ SETUPTOOLS_SCM_PRETEND_VERSION=0.22.1 VLLM_TARGET_DEVICE=tpu CC=gcc CXX=g++ \
 ### 3.4 Create venv + install all pins (all from public PyPI)
 
 ```bash
-cd /data/red_poc/tpu_benchmark_daily
+cd $REPO
 uv venv --python 3.12 .venv
 # Install: vllm (editable from previous step), the local torch-tpu wheel, and the pins in torchtpu-vllm's pyproject
 <venv>/bin/pip install /data/red_poc/torch_tpu/bazel-bin/ci/wheel/torch_tpu-*.whl
@@ -98,7 +100,7 @@ uv pip check                                                              # pass
 ### 3.5 Wire into the repo scripts (bypassing the GAR-dependent update_environment.sh)
 
 ```bash
-ln -s /data/red_poc/torchtpu-vllm /data/red_poc/tpu_benchmark_daily/third_party/torchtpu-vllm
+ln -s /data/red_poc/torchtpu-vllm $REPO/third_party/torchtpu-vllm
 ln -s <real model dir> models/Qwen3.5-397B-A17B-FP8   # provides config.json / tokenizer.json
 ```
 
@@ -161,7 +163,7 @@ ln -s <real model dir> models/Qwen3.5-397B-A17B-FP8   # provides config.json / t
 ### 5.3 Launch
 
 ```bash
-cd /data/red_poc/tpu_benchmark_daily
+cd $REPO
 nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
 # Wait for: curl http://127.0.0.1:18100/health → 200
 ```
@@ -196,7 +198,7 @@ nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
 
 ```bash
 # Start the DP8 server
-cd /data/red_poc/tpu_benchmark_daily && nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
+cd $REPO && nohup ./scripts/start_dp_server.sh > /data/red_poc/dp8_server.log 2>&1 &
 tail -f /data/red_poc/dp8_server.log                 # view logs / compile progress
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:18100/health   # health check
 

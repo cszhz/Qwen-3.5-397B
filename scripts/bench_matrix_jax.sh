@@ -2,7 +2,7 @@
 # JAX 后端(端口8000)同 harness 对照矩阵。结果存 matrix_results_jax。
 set -u
 
-VENV=/data/red_poc/tpu_benchmark_daily/.venv
+VENV="${REPO:?set REPO to your checkout root}/.venv"
 MODEL_DIR=/data/red_poc/models/Qwen3.5-397B-A17B-FP8
 SERVED="Qwen/Qwen3.5-397B-A17B-FP8"
 PORT=8000
