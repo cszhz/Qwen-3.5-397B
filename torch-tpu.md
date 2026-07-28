@@ -383,6 +383,6 @@ The JAX backend (port 8000, `run_vllm.sh`, TP=8) was run with the **exact same h
 ## 11. Optional Follow-ups
 
 - **PCP8 deep reproduction**: fetch `db5ae0ab` + rebuild the matching torch-tpu → run the 8192/1 sweep, filling in the pcp8 comparison (requires the PAT).
-- **Independent test matrix**: ✅ done (see §9.4, 3 workloads × concurrency sweep).
-- **Strict cross-backend A/B**: ✅ done (2026-07-28, see §9.5). The JAX backend (port 8000, committed config) was run with the same harness across all 5 workloads including pure prefill; result JSON is in `results/jax/`. Harness self-check passed (JAX 8192/1024 measured 20,020 ≈ report's 19,836).
+- **Independent test matrix**: ✅ done (see §9.2, 5 workloads A–E × concurrency sweep).
+- **Strict cross-backend A/B**: ✅ done (see §9.4). The JAX backend (port 8000, committed config) was run with the same harness across all 5 workloads including pure prefill; result JSON is in `results/jax/`.
 - Validate accuracy + throughput with real weights (dropping `--load-format dummy`).

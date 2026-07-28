@@ -310,7 +310,17 @@ Both backends drive the same 4 chips, so only one runs at a time; the A/B was me
 
 ---
 
-## 10. Optional Follow-ups
+## 10. Gotchas
+
+1. **Actual parallelism ≠ the CLI request** — the command line asks for `TP=8 + EP` + `enable_dp_attention`, but the TPU backend actually runs **attention DP=8 + MoE EP=8, TP=1, PP=1** (see §5). Check the `ShardingConfigManager` line in the logs to confirm what really got sharded.
+2. **First compile is ~69 min (one-time)** — the initial XLA compile dominates startup (§6); artifacts are cached under `/data/red_poc/{xla_cache,torch_compile_cache}`, so subsequent restarts (`docker restart`) skip it.
+3. **Changing batch/length params forces a full recompile** — raising `--max-num-seqs` or `--max-model-len` invalidates the cache and triggers a fresh ~70 min compile for the new bucket (§9.3). Plan tuning runs accordingly.
+4. **Decode throughput is capped by `--max-num-seqs=64`** — decode-heavy workloads are TPOT-bound at ~40 tok/s per stream, so total ≈ concurrent streams × ~40; the batch cap (not the hardware) is the limiter (§9.3).
+5. **Credentials** — the HF token is a live credential; keep it in the `HF_TOKEN` env var only, never in commits/logs/reports.
+
+---
+
+## 11. Optional Follow-ups
 
 - Run the recipe's built-in benchmark (1k/8k and 8k/1k workloads) for throughput
 - Tuning: raise `--max-num-seqs` / `--max-model-len` to trade for throughput or long context
