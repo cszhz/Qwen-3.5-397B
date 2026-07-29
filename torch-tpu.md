@@ -224,7 +224,7 @@ kill -TERM <PID> ...
 ### 9.1 Measurement setup
 
 - **Tool**: `vllm bench serve` (in the venv), `--dataset-name random`, `--endpoint /v1/completions`, `--random-range-ratio 0` (fixed length), `--ignore-eos --temperature 0 --seed 42`, `--request-rate inf`.
-- **Harness**: `scripts/bench_matrix.sh` (torch-tpu) and `scripts/bench_matrix_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `JAX.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
+- **Harness**: `scripts/bench_torch-tpu.sh` (torch-tpu) and `scripts/bench_matrix_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `JAX.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
 - **Raw JSON**: `results/torch-tpu/` (this backend), `results/jax/` (JAX). Filenames: `in<INPUT>_out<OUTPUT>_c<CONCURRENCY>.json`.
 - **Workloads**:
 
