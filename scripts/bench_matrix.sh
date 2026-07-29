@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# torch-tpu DP8 独立测试矩阵:3 种负载 × 并发扫描
-# 直接调用 vllm bench serve,结果存 /data/red_poc/matrix_results,不覆盖复现报告。
+# torch-tpu DP8 independent benchmark matrix: 5 workloads (A-E) x concurrency sweep.
+# Calls `vllm bench serve` directly; raw JSON is written to results/torch-tpu/.
 set -u
 
 PROJ="${REPO:?set REPO to your checkout root}"
 VENV=$PROJ/.venv
-MODEL_DIR=$PROJ/models/Qwen3.5-397B-A17B-FP8
-SERVED=Qwen3.5-397B-A17B-FP8
-PORT=18100
-OUT=/data/red_poc/matrix_results
+MODEL_DIR="${MODEL_DIR:-$PROJ/models/Qwen3.5-397B-A17B-FP8}"
+SERVED="${SERVED_MODEL_NAME:-Qwen3.5-397B-A17B-FP8}"
+PORT="${PORT:-18100}"
+OUT="${RESULT_DIR:-$PROJ/results/torch-tpu}"
 mkdir -p "$OUT"
 
-# 负载定义: "输入 输出 并发列表"
+# Workload definition: "input output concurrency-list"
 run_load() {
   local IN=$1 O=$2; shift 2
   local CONCS=("$@")
   for c in "${CONCS[@]}"; do
-    # num-prompts 随并发缩放,保证约 2 轮稳态,同时限制低并发/decode 密集耗时
+    # Scale num-prompts with concurrency (~2 steady-state rounds) while capping
+    # the cost of low-concurrency / decode-heavy points.
     local np=$(( c * 2 )); (( np < 16 )) && np=16; (( np > 128 )) && np=128
     local label="in${IN}_out${O}_c${c}"
     local jf="$OUT/${label}.json"
-    if [[ -f "$jf" ]]; then echo "[skip] $label 已存在"; continue; fi
-    echo "===== 跑 $label (num-prompts=$np) $(date +%H:%M:%S) ====="
+    if [[ -f "$jf" ]]; then echo "[skip] $label already exists"; continue; fi
+    echo "===== run $label (num-prompts=$np) $(date +%H:%M:%S) ====="
     "$VENV/bin/vllm" bench serve \
       --backend openai --host 127.0.0.1 --port "$PORT" \
       --endpoint /v1/completions \
@@ -36,15 +37,15 @@ run_load() {
   done
 }
 
-echo "########## 负载 A: 1024/1024 (均衡) ##########"
+echo "########## Workload A: 1024/1024 (balanced) ##########"
 run_load 1024 1024 1 2 4 8 16 32 64
-echo "########## 负载 B: 1024/8192 (decode 密集) ##########"
+echo "########## Workload B: 1024/8192 (decode-heavy) ##########"
 run_load 1024 8192 4 8 16 32 64
-echo "########## 负载 C: 8192/1024 (prefill 密集, 可比 JAX) ##########"
+echo "########## Workload C: 8192/1024 (prefill-heavy, comparable to JAX) ##########"
 run_load 8192 1024 1 2 4 8 16 32 64
-echo "########## 负载 D: 1024/1 (纯 prefill, 短输入) ##########"
+echo "########## Workload D: 1024/1 (pure prefill, short input) ##########"
 run_load 1024 1 1 2 4 8 16 32 64
-echo "########## 负载 E: 8192/1 (纯 prefill, 仓库口径) ##########"
+echo "########## Workload E: 8192/1 (pure prefill, repo headline) ##########"
 run_load 8192 1 1 2 4 8 16 32 64
 
-echo "########## 矩阵完成 $(date +%H:%M:%S) ##########"
+echo "########## matrix complete $(date +%H:%M:%S) ##########"

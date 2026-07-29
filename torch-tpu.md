@@ -306,7 +306,7 @@ DP8 server (`scripts/start_dp_server.sh`, DP=8 / TP=1 / EP, port 18100), all fiv
 
 ### 9.3 Reproduction of the repo baseline
 
-The repo's committed metric is **workload E (8192/1, pure prefill)**. `scripts/bench_all.sh` reproduces it under the repo's own口径 (fixed 128 prompts, concurrency sweep):
+The repo's committed metric is **workload E (8192/1, pure prefill)**. `scripts/bench_all.sh` reproduces it under the repo's own protocol (fixed 128 prompts, concurrency sweep):
 
 | Concurrency | Total token throughput (tok/s) | Req/s |
 |-------------|-------------------------------|-------|

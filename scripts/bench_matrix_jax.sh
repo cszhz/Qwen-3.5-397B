@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# JAX 后端(端口8000)同 harness 对照矩阵。结果存 matrix_results_jax。
+# JAX backend (port 8000) same-harness comparison matrix. Raw JSON -> results/jax/.
 set -u
 
-VENV="${REPO:?set REPO to your checkout root}/.venv"
-MODEL_DIR=/data/red_poc/models/Qwen3.5-397B-A17B-FP8
-SERVED="Qwen/Qwen3.5-397B-A17B-FP8"
-PORT=8000
-OUT=/data/red_poc/matrix_results_jax
+PROJ="${REPO:?set REPO to your checkout root}"
+VENV="$PROJ/.venv"
+MODEL_DIR="${MODEL_DIR:-$PROJ/models/Qwen3.5-397B-A17B-FP8}"
+SERVED="${SERVED_MODEL_NAME:-Qwen/Qwen3.5-397B-A17B-FP8}"
+PORT="${PORT:-8000}"
+OUT="${RESULT_DIR:-$PROJ/results/jax}"
 mkdir -p "$OUT"
 
 run_load() {
@@ -16,8 +17,8 @@ run_load() {
     local np=$(( c * 2 )); (( np < 16 )) && np=16; (( np > 128 )) && np=128
     local label="in${IN}_out${O}_c${c}"
     local jf="$OUT/${label}.json"
-    if [[ -f "$jf" ]]; then echo "[skip] $label 已存在"; continue; fi
-    echo "===== 跑 $label (num-prompts=$np) $(date +%H:%M:%S) ====="
+    if [[ -f "$jf" ]]; then echo "[skip] $label already exists"; continue; fi
+    echo "===== run $label (num-prompts=$np) $(date +%H:%M:%S) ====="
     "$VENV/bin/vllm" bench serve \
       --backend openai --host 127.0.0.1 --port "$PORT" \
       --endpoint /v1/completions \
@@ -32,15 +33,15 @@ run_load() {
   done
 }
 
-echo "########## D: 1024/1 (纯 prefill) ##########"
+echo "########## Workload D: 1024/1 (pure prefill) ##########"
 run_load 1024 1 1 2 4 8 16 32 64
-echo "########## E: 8192/1 (纯 prefill, 仓库口径) ##########"
+echo "########## Workload E: 8192/1 (pure prefill, repo headline) ##########"
 run_load 8192 1 1 2 4 8 16 32 64
-echo "########## A: 1024/1024 (均衡) ##########"
+echo "########## Workload A: 1024/1024 (balanced) ##########"
 run_load 1024 1024 1 2 4 8 16 32 64
-echo "########## C: 8192/1024 (prefill 密集) ##########"
+echo "########## Workload C: 8192/1024 (prefill-heavy) ##########"
 run_load 8192 1024 1 2 4 8 16 32 64
-echo "########## B: 1024/8192 (decode 密集) ##########"
+echo "########## Workload B: 1024/8192 (decode-heavy) ##########"
 run_load 1024 8192 4 8 16 32 64
 
-echo "########## JAX 矩阵完成 $(date +%H:%M:%S) ##########"
+echo "########## JAX matrix complete $(date +%H:%M:%S) ##########"
