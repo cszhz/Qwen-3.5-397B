@@ -224,7 +224,7 @@ kill -TERM <PID> ...
 ### 9.1 Measurement setup
 
 - **Tool**: `vllm bench serve` (in the venv), `--dataset-name random`, `--endpoint /v1/completions`, `--random-range-ratio 0` (fixed length), `--ignore-eos --temperature 0 --seed 42`, `--request-rate inf`.
-- **Harness**: `scripts/bench_torch-tpu.sh` (torch-tpu) and `scripts/bench_matrix_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `JAX.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
+- **Harness**: `scripts/bench_torch-tpu.sh` (torch-tpu) and `scripts/bench_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `JAX.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
 - **Raw JSON**: `results/torch-tpu/` (this backend), `results/jax/` (JAX). Filenames: `in<INPUT>_out<OUTPUT>_c<CONCURRENCY>.json`.
 - **Workloads**:
 
@@ -328,7 +328,7 @@ The repo's committed metric is **workload E (8192/1, pure prefill)**. `scripts/b
 
 ### 9.4 Cross-backend A/B vs JAX (same harness)
 
-The JAX backend (port 8000, `run_vllm.sh`, TP=8) was run with the **exact same harness** (`bench_matrix_jax.sh`, identical num-prompts / seed / parameters); raw JSON in `results/jax/`. Peak point (c64) per workload:
+The JAX backend (port 8000, `run_vllm.sh`, TP=8) was run with the **exact same harness** (`bench_jax.sh`, identical num-prompts / seed / parameters); raw JSON in `results/jax/`. Peak point (c64) per workload:
 
 | Workload (in/out) | Type | torch-tpu | JAX | c64 winner |
 |-------------------|------|-----------|-----|------------|

@@ -25,9 +25,9 @@ All scripts are self-contained (self-locating paths, env-overridable); nothing p
 | [`scripts/bench_all.sh`](scripts/bench_all.sh) | torch-tpu | Headline benchmark: `vllm bench serve` concurrency sweep at a fixed length (default 8192/1), writes `summary.json`. |
 | [`scripts/bench_torch-tpu.sh`](scripts/bench_torch-tpu.sh) | torch-tpu | Independent benchmark matrix (5 workloads × concurrency sweep), port 18100. |
 | [`scripts/run_vllm.sh`](scripts/run_vllm.sh) | JAX | Launch the `tpu_inference` Docker backend (port 8000). Set `HF_TOKEN` before running. |
-| [`scripts/bench_matrix_jax.sh`](scripts/bench_matrix_jax.sh) | JAX | Same matrix harness against the JAX server (port 8000). |
+| [`scripts/bench_jax.sh`](scripts/bench_jax.sh) | JAX | Same matrix harness against the JAX server (port 8000). |
 
-Set `REPO=/path/to/this/checkout` (used by `bench_matrix*.sh`); the server/bench scripts otherwise self-locate to the repo root.
+Set `REPO=/path/to/this/checkout` (used by `bench_torch-tpu.sh` / `bench_jax.sh`); the server/bench scripts otherwise self-locate to the repo root.
 
 ## Raw results
 

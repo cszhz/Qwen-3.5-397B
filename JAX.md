@@ -187,7 +187,7 @@ curl -s http://localhost:8000/v1/chat/completions \
 ### 9.1 Measurement setup
 
 - **Tool**: `vllm bench serve` inside the container (same source as the recipe's benchmark_serving), `--dataset-name random`, `--endpoint /v1/completions`, `--random-range-ratio 0` (fixed length), `--ignore-eos --temperature 0 --seed 42`, `--request-rate inf`.
-- **Harness**: `scripts/bench_matrix_jax.sh` (JAX) and `scripts/bench_torch-tpu.sh` (torch-tpu) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends share the harness, §9.2 here and the cross-backend A/B in §9.4 are directly comparable with `torch-tpu.md` §9.2.
+- **Harness**: `scripts/bench_jax.sh` (JAX) and `scripts/bench_torch-tpu.sh` (torch-tpu) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends share the harness, §9.2 here and the cross-backend A/B in §9.4 are directly comparable with `torch-tpu.md` §9.2.
 - **Raw JSON**: `results/jax/` (this backend), `results/torch-tpu/` (torch-tpu). Filenames: `in<INPUT>_out<OUTPUT>_c<CONCURRENCY>.json`.
 - **Workloads**:
 
