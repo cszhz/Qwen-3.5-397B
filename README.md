@@ -9,10 +9,10 @@ vLLM, across two independent TPU backends.
 | Doc | Backend | Contents |
 |-----|---------|----------|
 | [`torch-tpu.md`](torch-tpu.md) | **torch-tpu** — native PyTorch PrivateUse1 (source-built, port 18100, DP8) | Build-from-source (GAR-free), serving, full independent benchmark matrix, and a controlled A/B vs the JAX backend |
-| [`JAX.md`](JAX.md) | **tpu_inference** — JAX (Docker, port 8000, TP=8 + attention DP + MoE EP) | Docker deployment, serving config, and benchmarks |
+| [`jax.md`](jax.md) | **tpu_inference** — JAX (Docker, port 8000, TP=8 + attention DP + MoE EP) | Docker deployment, serving config, and benchmarks |
 
 Both backends drive the same 4 TPU chips, so only one can run at a time; the A/B
-in `torch-tpu.md` §9.4 (and mirrored in `JAX.md` §9.4) was measured by stopping one and bringing up the other
+in `torch-tpu.md` §9.4 (and mirrored in `jax.md` §9.4) was measured by stopping one and bringing up the other
 under an identical harness.
 
 ## Scripts

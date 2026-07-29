@@ -3,7 +3,7 @@
 - **Report date**: 2026-07-26
 - **Goal**: Rebuild the **torch-tpu (native PyTorch PrivateUse1 backend)** throughput benchmark from scratch on this machine, **without** the private Google Artifact Registry (GAR), and verify whether the committed DP8 baseline reproduces.
 - **Verdict**: ✅ **DP8 fully reproduced** (peak 52,452 tok/s, slightly above the repo baseline of 40k–49k).
-- **Relation to the JAX backend**: This is a **completely independent** deployment path. The JAX `tpu_inference` backend (Docker, port 8000) is documented in `JAX.md`; this document covers the torch-tpu native backend (built from source, port 18100). The two use different measurement setups (see §9).
+- **Relation to the JAX backend**: This is a **completely independent** deployment path. The JAX `tpu_inference` backend (Docker, port 8000) is documented in `jax.md`; this document covers the torch-tpu native backend (built from source, port 18100). The two use different measurement setups (see §9).
 
 ---
 
@@ -224,7 +224,7 @@ kill -TERM <PID> ...
 ### 9.1 Measurement setup
 
 - **Tool**: `vllm bench serve` (in the venv), `--dataset-name random`, `--endpoint /v1/completions`, `--random-range-ratio 0` (fixed length), `--ignore-eos --temperature 0 --seed 42`, `--request-rate inf`.
-- **Harness**: `scripts/bench_torch-tpu.sh` (torch-tpu) and `scripts/bench_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `JAX.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
+- **Harness**: `scripts/bench_torch-tpu.sh` (torch-tpu) and `scripts/bench_jax.sh` (JAX) use **identical parameters** — `num-prompts = c×2` clamped to [16,128]. Because both backends are driven by the same harness, §9.2 here, `jax.md` §9.2, and the cross-backend A/B in §9.4 are directly comparable.
 - **Raw JSON**: `results/torch-tpu/` (this backend), `results/jax/` (JAX). Filenames: `in<INPUT>_out<OUTPUT>_c<CONCURRENCY>.json`.
 - **Workloads**:
 
