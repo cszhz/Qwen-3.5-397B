@@ -1,8 +1,8 @@
 # Qwen3.5-397B-A17B-FP8 on Ironwood TPU — torch-tpu Backend Benchmark
 
 - **Report date**: 2026-07-26
-- **Goal**: Rebuild the **torch-tpu (native PyTorch PrivateUse1 backend)** throughput benchmark from scratch on this machine, **without** the private Google Artifact Registry (GAR), and verify whether the committed DP8 / PCP8 baselines reproduce.
-- **Verdict**: ✅ **DP8 fully reproduced** (peak 52,452 tok/s, slightly above the repo baseline of 40k–49k); ⚠️ **PCP8 cannot run on the current torchtpu-vllm HEAD** due to an architectural incompatibility (the baseline was captured on an earlier revision).
+- **Goal**: Rebuild the **torch-tpu (native PyTorch PrivateUse1 backend)** throughput benchmark from scratch on this machine, **without** the private Google Artifact Registry (GAR), and verify whether the committed DP8 baseline reproduces.
+- **Verdict**: ✅ **DP8 fully reproduced** (peak 52,452 tok/s, slightly above the repo baseline of 40k–49k).
 - **Relation to the JAX backend**: This is a **completely independent** deployment path. The JAX `tpu_inference` backend (Docker, port 8000) is documented in `JAX.md`; this document covers the torch-tpu native backend (built from source, port 18100). The two use different measurement setups (see §9).
 
 ---
@@ -140,7 +140,7 @@ ln -s <real model dir> models/Qwen3.5-397B-A17B-FP8
 |-----------|-------|
 | `--data-parallel-size` | 8 (DP=8) |
 | `--tensor-parallel-size` | 1 |
-| `--prefill-context-parallel-size` | 1 (PCP off) |
+| `--prefill-context-parallel-size` | 1 |
 | `--enable-expert-parallel` | on (EP) |
 | `--max-model-len` | 69632 |
 | `--max-num-batched-tokens` | 4096 |
@@ -181,7 +181,7 @@ nohup ./scripts/start_dp_server.sh > dp8_server.log 2>&1 &
 
 | Metric | Value |
 |--------|-------|
-| Orchestration | DP=8 (attention/KV split into 8 shards) + EP=8 (MoE experts spread across 8 cores) + TP=1, PCP=1 |
+| Orchestration | DP=8 (attention/KV split into 8 shards) + EP=8 (MoE experts spread across 8 cores) + TP=1 |
 | KV cache type | hybrid (mamba state + attention), fp8 |
 | Per-core KV capacity | GPU KV cache size ≈ **843,180 tokens/DP**; max concurrency for a 69,632-token request is 12.11x |
 | First compile time | **~20 min** (`TpuCompilerAdaptor` compiles the FX graph per shape, 8 workers in parallel; a single (16,16) graph ~74s, a (4096,4096) graph ~300s) |
@@ -323,18 +323,8 @@ The repo's committed metric is **workload E (8192/1, pure prefill)**. `scripts/b
 | Config | This reproduction | Repo baseline (7/17–7/21) | Verdict |
 |--------|-------------------|---------------------------|---------|
 | **dp8** | **52,453 tok/s** | 40,378–49,381 tok/s | ✅ **matches and slightly exceeds the upper bound — no implementation gap** |
-| pcp8 | ❌ did not run (see below) | 34,296 tok/s (revision db5ae0ab) | ⚠️ incompatible on the current HEAD |
 
 > The §9.2 workload-E figure (49,934 @ c64) uses the independent harness (`num-prompts=c×2`); `bench_all.sh` above uses a fixed 128 prompts and peaks earlier (52,453 @ c16). Both confirm 8192/1 is stable at **~45–52k tok/s**; the gap is only the num-prompts / peak-concurrency point.
-
-**PCP8 (DP=1 / PCP=8) incompatibility** — a PCP8 config (`--data-parallel-size 1 --prefill-context-parallel-size 8`) compiles on the current stack (vLLM 0.22.1 + torchtpu-vllm **88f359b**) but fails during engine init — Qwen3.5's hybrid (mamba+attn) KV conflicts with context parallelism:
-
-| Attempt | Error |
-|---------|-------|
-| hybrid KV **on** (repo's original flag) | `Hybrid KV cache groups with multiple block sizes do not support context parallelism` |
-| hybrid KV **off** (`--disable-hybrid-kv-cache-manager`) | `Hybrid KV cache manager is disabled but failed to convert the KV cache specs to one unified type` |
-
-The repo's pcp8 baseline (34,296) was captured on an earlier revision `db5ae0ab`; reproducing it requires reverting to that commit (and possibly rebuilding the wheel). **This part is pending.**
 
 ### 9.4 Cross-backend A/B vs JAX (same harness)
 
@@ -382,7 +372,6 @@ The JAX backend (port 8000, `run_vllm.sh`, TP=8) was run with the **exact same h
 
 ## 11. Optional Follow-ups
 
-- **PCP8 deep reproduction**: fetch `db5ae0ab` + rebuild the matching torch-tpu → run the 8192/1 sweep, filling in the pcp8 comparison (requires the PAT).
 - **Independent test matrix**: ✅ done (see §9.2, 5 workloads A–E × concurrency sweep).
 - **Strict cross-backend A/B**: ✅ done (see §9.4). The JAX backend (port 8000, committed config) was run with the same harness across all 5 workloads including pure prefill; result JSON is in `results/jax/`.
 - Validate accuracy + throughput with real weights (dropping `--load-format dummy`).

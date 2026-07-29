@@ -61,7 +61,7 @@ COMPILATION_CONFIG=$(printf \
   "$COMPILE_SIZES")
 
 echo "Starting $SERVED_MODEL_NAME (torch-tpu DP8) from $MODEL_DIR"
-echo "parallelism: DP=8, PCP=1, TP=1 | compile sizes: $COMPILE_SIZES | port: $PORT"
+echo "parallelism: DP=8, TP=1 | compile sizes: $COMPILE_SIZES | port: $PORT"
 
 exec "$VENV_DIR/bin/python" \
   -m vllm.entrypoints.openai.api_server \
