@@ -1,0 +1,526 @@
+diff --git a/python/sgl_jax/srt/models/qwen3_5.py b/python/sgl_jax/srt/models/qwen3_5.py
+index f41c6f7..568335b 100644
+--- a/python/sgl_jax/srt/models/qwen3_5.py
++++ b/python/sgl_jax/srt/models/qwen3_5.py
+@@ -42,7 +42,7 @@ from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+ from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+ from sgl_jax.srt.layers.linear import LinearBase
+ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+-from sgl_jax.srt.layers.moe import GateLogit, TopK
++from sgl_jax.srt.layers.moe import GateLogit, TopK, create_moe_weights_mapping
+ from sgl_jax.srt.layers.radix_attention import RadixAttention
+ from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
+ from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
+@@ -364,7 +364,15 @@ class Qwen3_5MoeBlock(nnx.Module):
+             num_experts=self.num_experts,
+             weight_dtype=dtype,
+         )
+-        self.topk = TopK(topk=self.top_k, renormalize=renorm, layer_id=layer_id)
++        # Pass mesh so the biased/plain top-k Pallas kernel is wrapped in
++        # shard_map (each device runs on its local token slice); without it the
++        # kernel's fori_loop carry inherits the 'data' sharding and JAX 0.10
++        # rejects the carry-type mismatch. Mirrors qwen3_moe.
++        self.topk = TopK(topk=self.top_k, renormalize=renorm, layer_id=layer_id, mesh=mesh)
++        # Pass the (optional) sglang QuantizationConfig so FusedEPMoE can allocate
++        # fp8 weights + block-scale params via quantize_weights(is_static=True).
++        # None -> unchanged bf16 behaviour.
++        quant_cfg = getattr(config, "quantization_config", None)
+         self.experts = FusedEPMoE(
+             hidden_size=hidden,
+             num_experts=self.num_experts,
+@@ -377,6 +385,7 @@ class Qwen3_5MoeBlock(nnx.Module):
+             activation="silu",
+             layer_id=layer_id,
+             renormalize_topk_logits=renorm,
++            quantization_config=quant_cfg,
+         )
+         # Dense shared expert (always present for 35B-A3B) gated per-token.
+         self.shared_experts = Qwen2MoeMLP(
+@@ -697,6 +706,96 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+         block.experts.w1.value = self._put(w1, (("data", "tensor"), None, None))
+         block.experts.w3.value = self._put(w3, (("data", "tensor"), None, None))
+ 
++    @staticmethod
++    def _np_block_dequant(w_fp8, scale, block: int = 128):
++        """Block-dequant an fp8 weight [out, in] with a 2D multiplicative
++        weight_scale_inv [out/block, in/block] -> float32 [out, in].
++
++        The Qwen3.5-FP8 checkpoint stores dequant = fp8 * weight_scale_inv over
++        128x128 blocks. Returns float32 (``_put`` casts to the model dtype).
++        """
++        w = np.asarray(w_fp8).astype(np.float32)
++        s = np.asarray(scale).astype(np.float32)
++        out, inn = w.shape
++        s_full = np.repeat(np.repeat(s, block, axis=0), block, axis=1)[:out, :inn]
++        return w * s_full
++
++    def _load_gdn_layer_fp8(self, fm, weight_info, layer_idx, tp):
++        """Static-fp8 GDN load. in_proj_qkv / in_proj_z / out_proj are stored
++        fp8 + weight_scale_inv but the GDN backend + LinearBase run in bf16
++        (config's modules_to_not_convert keeps GDN unquantized), so dequantize
++        them here. in_proj_a / in_proj_b / conv1d stay bf16.
++        """
++        src = f"model.language_model.layers.{layer_idx}.linear_attn"
++        gdn = self.language_model.model.layers[layer_idx].self_attn
++        block_n = 128
++
++        def _deq(name):
++            w = self._read_host(fm, weight_info, f"{src}.{name}.weight")
++            s = self._read_host(fm, weight_info, f"{src}.{name}.weight_scale_inv")
++            return self._np_block_dequant(w, s, block_n)
++
++        # in_proj_qkvz = concat([in_proj_qkv=[Q|K|V], in_proj_z]) -> [hidden, 2k+2v]
++        qkv = _deq("in_proj_qkv")  # [2k+v, hidden]
++        z = _deq("in_proj_z")  # [v, hidden]
++        qkvz = np.concatenate([qkv, z], axis=0).T  # [hidden, 2k+2v]
++        gdn.in_proj_qkvz.weight.value = self._put(qkvz, (None, "tensor"))
++
++        # in_proj_ba = concat([in_proj_b, in_proj_a]) (both bf16) -> [hidden, 2*n_v]
++        b = self._read_host(fm, weight_info, f"{src}.in_proj_b.weight")
++        a = self._read_host(fm, weight_info, f"{src}.in_proj_a.weight")
++        ba = np.concatenate([b, a], axis=0).T
++        gdn.in_proj_ba.weight.value = self._put(ba, (None, "tensor"))
++
++        # conv1d (bf16): HF [conv_dim, 1, K] -> [conv_dim, K] -> rank-major stripe.
++        conv = self._read_host(fm, weight_info, f"{src}.conv1d.weight")
++        conv = conv.reshape(conv.shape[0], conv.shape[-1])
++        conv = self._stripe_conv(conv, gdn, tp)
++        gdn.conv1d.weight.value = self._put(conv, ("tensor", None))
++
++        # out_proj: fp8 [hidden, value_dim] -> dequant -> LinearBase.weight
++        # [value_dim, hidden] (transpose), sharded ("tensor", None).
++        out_w = _deq("out_proj")  # [hidden, value_dim]
++        gdn.out_proj.weight.value = self._put(out_w.T, ("tensor", None))
++
++    def _load_attn_kv_fp8(self, fm, weight_info, loader, layer_idx):
++        """Static-fp8 full-attention k_proj / v_proj: dequant fp8 -> bf16 then
++        GQA-replicate KV heads to match the TP-padded LinearBase output.
++
++        Only 2 KV heads (out=512 -> 4 blocks) make the 128x128 block scale
++        unshardable on 'tensor' at TP=8, so k/v stay bf16 LinearBase (excluded
++        from the fp8 YAML) and load here. q/o remain fp8 QuantizedLinear.
++        """
++        src = f"model.language_model.layers.{layer_idx}.self_attn"
++        attn = self.language_model.model.layers[layer_idx].self_attn
++        for pj, mod in (("k_proj", attn.k_proj), ("v_proj", attn.v_proj)):
++            w = self._read_host(fm, weight_info, f"{src}.{pj}.weight")  # fp8 [out, in]
++            s = self._read_host(fm, weight_info, f"{src}.{pj}.weight_scale_inv")
++            w_bf16 = self._np_block_dequant(w, s, 128)  # [out, in] f32
++            # GQA KV-head replication on axis 0 (out = heads*head_dim) to the
++            # TP-padded head count, then transpose to LinearBase [in, out].
++            w_pad = loader._apply_kv_head_padding(jnp.asarray(w_bf16), f"{src}.{pj}.weight")
++            mod.weight.value = self._put(np.asarray(w_pad).T, (None, "tensor"))
++
++    def _load_shared_expert_fp8(self, fm, weight_info, layer_idx):
++        """Static-fp8 MoE shared expert -> bf16 LinearBase. gate/up are narrow-N
++        (out=1024, per-TP N=128 == block_n) which the block-wise fp8 kernel
++        rejects, so keep the shared expert bf16 and dequantize here.
++        """
++        src = f"model.language_model.layers.{layer_idx}.mlp.shared_expert"
++        se = self.language_model.model.layers[layer_idx].mlp.shared_experts
++
++        def _deq(name):
++            w = self._read_host(fm, weight_info, f"{src}.{name}.weight")
++            s = self._read_host(fm, weight_info, f"{src}.{name}.weight_scale_inv")
++            return self._np_block_dequant(w, s, 128)
++
++        # gate/up [inter, hidden] -> LinearBase [hidden, inter], sharded (None, "tensor").
++        se.gate_proj.weight.value = self._put(_deq("gate_proj").T, (None, "tensor"))
++        se.up_proj.weight.value = self._put(_deq("up_proj").T, (None, "tensor"))
++        # down [hidden, inter] -> LinearBase [inter, hidden], sharded ("tensor", None).
++        se.down_proj.weight.value = self._put(_deq("down_proj").T, ("tensor", None))
++
+     def load_weights(self, model_config: ModelConfig):
+         from sgl_jax.srt.utils.weight_utils import (
+             SequentialSafetensorManager,
+@@ -711,8 +810,14 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+ 
+         mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
+ 
+-        # Keys handled manually (concat / stripe / split) — excluded from the
+-        # shared loader, which handles every other (simple) weight.
++        quant_cfg = getattr(hf_config, "quantization_config", None)
++        is_static = quant_cfg is not None and getattr(quant_cfg, "is_static_checkpoint", False)
++
++        # Keys handled manually (concat / stripe / split / fp8-dequant) —
++        # excluded from the shared loader, which handles every other (simple)
++        # weight (including __MOE_EXPERTS__ per-expert fp8 experts + scales, and
++        # the QuantizedLinear .weight_q / .weight_scale attention & shared-expert
++        # weights when the checkpoint is a static fp8 checkpoint).
+         special = set()
+         for i in gdn_layers:
+             s = f"model.language_model.layers.{i}.linear_attn"
+@@ -725,9 +830,37 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+                     f"{s}.conv1d.weight",
+                 }
+             )
+-        # Pre-fused experts exist only in MoE variants; dense FFN weights are
+-        # simple column/row-parallel and go through the shared loader.
+-        if is_moe:
++            if is_static:
++                # GDN fp8 sidecars + out_proj are dequantized manually to bf16.
++                special.update(
++                    {
++                        f"{s}.in_proj_qkv.weight_scale_inv",
++                        f"{s}.in_proj_z.weight_scale_inv",
++                        f"{s}.out_proj.weight",
++                        f"{s}.out_proj.weight_scale_inv",
++                    }
++                )
++        # Static fp8 k/v attention proj + shared experts are dequantized manually.
++        full_attn_ids = set(getattr(tc, "full_attention_layer_ids", []))
++        if is_static:
++            for i in full_attn_ids:
++                a = f"model.language_model.layers.{i}.self_attn"
++                special.update(
++                    {
++                        f"{a}.k_proj.weight",
++                        f"{a}.k_proj.weight_scale_inv",
++                        f"{a}.v_proj.weight",
++                        f"{a}.v_proj.weight_scale_inv",
++                    }
++                )
++            if is_moe:
++                for i in range(num_layers):
++                    se = f"model.language_model.layers.{i}.mlp.shared_expert"
++                    for pj in ("gate_proj", "up_proj", "down_proj"):
++                        special.update({f"{se}.{pj}.weight", f"{se}.{pj}.weight_scale_inv"})
++        # Pre-fused experts exist only in bf16 MoE variants; static fp8 experts
++        # are per-expert and go through the shared loader's __MOE_EXPERTS__ path.
++        if is_moe and not is_static:
+             for i in range(num_layers):
+                 special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
+ 
+@@ -740,8 +873,17 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+         tp = self.mesh.shape.get("tensor", 1)
+         with SequentialSafetensorManager() as fm:
+             for i in gdn_layers:
+-                self._load_gdn_layer(fm, weight_info, i, tp)
+-            if is_moe:
++                if is_static:
++                    self._load_gdn_layer_fp8(fm, weight_info, i, tp)
++                else:
++                    self._load_gdn_layer(fm, weight_info, i, tp)
++            if is_static:
++                for i in sorted(set(tc.full_attention_layer_ids)):
++                    self._load_attn_kv_fp8(fm, weight_info, loader, i)
++                if is_moe:
++                    for i in range(num_layers):
++                        self._load_shared_expert_fp8(fm, weight_info, i)
++            if is_moe and not is_static:
+                 for i in range(num_layers):
+                     self._load_moe_gate_up(fm, weight_info, i)
+ 
+@@ -752,7 +894,15 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
+         import re as _re
+ 
+         ckpt = set(weight_info.keys())
+-        consumed = {k for k in mappings if k in ckpt}
++        consumed = set()
++        for k, wm in mappings.items():
++            if k.startswith("__MOE_EXPERTS__"):
++                # Aggregated MoE mapping: real ckpt keys live in target_path[1:].
++                for sub in wm.target_path[1:]:
++                    if sub in ckpt:
++                        consumed.add(sub)
++            elif k in ckpt:
++                consumed.add(k)
+         skip_pats = list(visual_skip) + list(mtp_skip)
+         skipped = {k for k in ckpt if any(_re.match(p, k) for p in skip_pats)}
+         unexpected = ckpt - consumed - skipped
+@@ -799,8 +949,38 @@ def _create_qwen3_5_weight_mappings(hf_config):
+     conv_dim = 2 * key_dim + value_dim
+     conv_k = int(tc.linear_conv_kernel_dim)
+ 
++    quant_cfg = getattr(hf_config, "quantization_config", None)
++    is_static = quant_cfg is not None and getattr(quant_cfg, "is_static_checkpoint", False)
++    num_experts = int(getattr(tc, "num_experts", 0))
++
+     mappings: dict[str, WeightMapping] = {}
+ 
++    def add_linear(src_prefix, dst_prefix, sharding_std, kv_head_padding=False):
++        """Map a LinearBase weight. bf16: .weight (transposed). static fp8: the
++        checkpoint stores a QuantizedLinear .weight_q [out, in] (no transpose,
++        kernel axes swapped) plus a block .weight_scale_inv sidecar."""
++        if not is_static:
++            mappings[f"{src_prefix}.weight"] = WeightMapping(
++                target_path=f"{dst_prefix}.weight",
++                sharding=sharding_std,
++                transpose=True,
++                kv_head_padding=kv_head_padding,
++            )
++            return
++        sharding_quant = (sharding_std[1], sharding_std[0])
++        mappings[f"{src_prefix}.weight"] = WeightMapping(
++            target_path=f"{dst_prefix}.weight_q",
++            sharding=sharding_quant,
++            transpose=False,
++            kv_head_padding=kv_head_padding,
++        )
++        # No kv_head_padding on the scale: expand handles the un-replicated n_out.
++        mappings[f"{src_prefix}.weight_scale_inv"] = WeightMapping(
++            target_path=f"{dst_prefix}.weight_scale",
++            sharding=sharding_quant,
++            transpose=False,
++        )
++
+     # Top-level
+     mappings["model.language_model.embed_tokens.weight"] = WeightMapping(
+         target_path="language_model.model.embed_tokens.embedding",
+@@ -835,28 +1015,37 @@ def _create_qwen3_5_weight_mappings(hf_config):
+         )
+ 
+         if is_full:
+-            mappings[f"{src}.self_attn.q_proj.weight"] = WeightMapping(
+-                target_path=f"{dst}.self_attn.q_proj.weight",
+-                sharding=(None, "tensor"),
+-                transpose=True,
+-            )
+-            mappings[f"{src}.self_attn.k_proj.weight"] = WeightMapping(
+-                target_path=f"{dst}.self_attn.k_proj.weight",
+-                sharding=(None, "tensor"),
+-                transpose=True,
+-                kv_head_padding=True,
+-            )
+-            mappings[f"{src}.self_attn.v_proj.weight"] = WeightMapping(
+-                target_path=f"{dst}.self_attn.v_proj.weight",
+-                sharding=(None, "tensor"),
+-                transpose=True,
+-                kv_head_padding=True,
+-            )
+-            mappings[f"{src}.self_attn.o_proj.weight"] = WeightMapping(
+-                target_path=f"{dst}.self_attn.o_proj.weight",
+-                sharding=("tensor", None),
+-                transpose=True,
+-            )
++            add_linear(f"{src}.self_attn.q_proj", f"{dst}.self_attn.q_proj", (None, "tensor"))
++            add_linear(f"{src}.self_attn.o_proj", f"{dst}.self_attn.o_proj", ("tensor", None))
++            if not is_static:
++                add_linear(
++                    f"{src}.self_attn.k_proj",
++                    f"{dst}.self_attn.k_proj",
++                    (None, "tensor"),
++                    kv_head_padding=True,
++                )
++                add_linear(
++                    f"{src}.self_attn.v_proj",
++                    f"{dst}.self_attn.v_proj",
++                    (None, "tensor"),
++                    kv_head_padding=True,
++                )
++            else:
++                # Static fp8: only 2 KV heads -> block scale [4, in_blocks] can't
++                # shard on 'tensor' at TP>2 and needs GQA block replication. Keep
++                # k/v bf16 (excluded from the YAML) and dequant manually. Markers
++                # keep the load-summary coverage check happy.
++                for pj in ("k_proj", "v_proj"):
++                    mappings[f"{src}.self_attn.{pj}.weight"] = WeightMapping(
++                        target_path=f"__ATTN_{pj.upper()}_WEIGHT__{i}",
++                        sharding=(None, None),
++                        transpose=False,
++                    )
++                    mappings[f"{src}.self_attn.{pj}.weight_scale_inv"] = WeightMapping(
++                        target_path=f"__ATTN_{pj.upper()}_SCALE__{i}",
++                        sharding=(None, None),
++                        transpose=False,
++                    )
+             mappings[f"{src}.self_attn.q_norm.weight"] = WeightMapping(
+                 target_path=f"{dst}.self_attn.q_norm.weight", sharding=(None,), transpose=False
+             )
+@@ -893,11 +1082,29 @@ def _create_qwen3_5_weight_mappings(hf_config):
+             mappings[f"{src}.linear_attn.norm.weight"] = WeightMapping(
+                 target_path=f"{dst}.self_attn.norm.scale", sharding=(None,), transpose=False
+             )
+-            mappings[f"{src}.linear_attn.out_proj.weight"] = WeightMapping(
+-                target_path=f"{dst}.self_attn.out_proj.weight",
+-                sharding=("tensor", None),
+-                transpose=True,
+-            )
++            if is_static:
++                # GDN stays bf16 (config modules_to_not_convert); in_proj_qkv /
++                # in_proj_z / out_proj are fp8 on disk and dequantized manually
++                # in _load_gdn_layer_fp8. These markers keep the load summary's
++                # coverage check happy (real load is manual).
++                mappings[f"{src}.linear_attn.in_proj_qkv.weight_scale_inv"] = WeightMapping(
++                    target_path=f"__GDN_QKV_SCALE__{i}", sharding=(None, None), transpose=False
++                )
++                mappings[f"{src}.linear_attn.in_proj_z.weight_scale_inv"] = WeightMapping(
++                    target_path=f"__GDN_Z_SCALE__{i}", sharding=(None, None), transpose=False
++                )
++                mappings[f"{src}.linear_attn.out_proj.weight"] = WeightMapping(
++                    target_path=f"__GDN_OUT_PROJ_WEIGHT__{i}", sharding=(None, None), transpose=False
++                )
++                mappings[f"{src}.linear_attn.out_proj.weight_scale_inv"] = WeightMapping(
++                    target_path=f"__GDN_OUT_PROJ_SCALE__{i}", sharding=(None, None), transpose=False
++                )
++            else:
++                mappings[f"{src}.linear_attn.out_proj.weight"] = WeightMapping(
++                    target_path=f"{dst}.self_attn.out_proj.weight",
++                    sharding=("tensor", None),
++                    transpose=True,
++                )
+ 
+         # FFN. Dense layers carry a plain SwiGLU (mlp.{gate,up,down}_proj); MoE
+         # layers carry the pre-fused routed experts + sigmoid-gated shared expert.
+@@ -919,37 +1126,86 @@ def _create_qwen3_5_weight_mappings(hf_config):
+             )
+             continue
+ 
+-        # MoE (all layers when is_moe). Experts are pre-fused on disk.
++        # MoE (all layers when is_moe). Router gate stays bf16.
+         mappings[f"{src}.mlp.gate.weight"] = WeightMapping(
+             target_path=f"{dst}.mlp.moe_gate.kernel", sharding=(None, None), transpose=True
+         )
+-        mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightMapping(
+-            target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
+-            sharding=(("data", "tensor"), None, None),
+-            transpose=False,
+-        )
+-        # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden] (transpose last 2).
+-        mappings[f"{src}.mlp.experts.down_proj"] = WeightMapping(
+-            target_path=f"{dst}.mlp.experts.w2",
+-            sharding=(("data", "tensor"), None, None),
+-            transpose=False,
+-            transpose_axes=(0, 2, 1),
+-        )
+-        mappings[f"{src}.mlp.shared_expert.gate_proj.weight"] = WeightMapping(
+-            target_path=f"{dst}.mlp.shared_experts.gate_proj.weight",
+-            sharding=(None, "tensor"),
+-            transpose=True,
+-        )
+-        mappings[f"{src}.mlp.shared_expert.up_proj.weight"] = WeightMapping(
+-            target_path=f"{dst}.mlp.shared_experts.up_proj.weight",
+-            sharding=(None, "tensor"),
+-            transpose=True,
+-        )
+-        mappings[f"{src}.mlp.shared_expert.down_proj.weight"] = WeightMapping(
+-            target_path=f"{dst}.mlp.shared_experts.down_proj.weight",
+-            sharding=("tensor", None),
+-            transpose=True,
+-        )
++
++        if not is_static:
++            # bf16 variants ship pre-fused experts (manual load in load_weights).
++            mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightMapping(
++                target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
++                sharding=(("data", "tensor"), None, None),
++                transpose=False,
++            )
++            # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden].
++            mappings[f"{src}.mlp.experts.down_proj"] = WeightMapping(
++                target_path=f"{dst}.mlp.experts.w2",
++                sharding=(("data", "tensor"), None, None),
++                transpose=False,
++                transpose_axes=(0, 2, 1),
++            )
++        else:
++            # Static fp8: per-expert unfused gate/up/down -> FusedEPMoE w1/w3/w2
++            # via the shared loader's __MOE_EXPERTS__ path, plus weight_scale_inv
++            # sidecars into w1_scale/w3_scale/w2_scale (mirror qwen3_moe).
++            moe_mappings = create_moe_weights_mapping(
++                prefix=src,
++                target_prefix=dst,
++                num_experts=num_experts,
++                moe_backend="fused",
++                moe_path="mlp.experts",
++                source_expert_pattern="{i}",
++                physical_to_logical_map=None,
++            )
++            mappings.update(moe_mappings)
++            for moe_key, wm in list(moe_mappings.items()):
++                if not moe_key.startswith("__MOE_EXPERTS__"):
++                    continue
++                target_base = wm.target_path[0]
++                expert_scale_keys = [
++                    k.replace(".weight", ".weight_scale_inv") for k in wm.target_path[1:]
++                ]
++                scale_target = f"{target_base}_scale"
++                mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
++                    target_path=[scale_target] + expert_scale_keys,
++                    sharding=(("data", "tensor"), None, None),
++                    transpose=wm.transpose,
++                    concat_axis=wm.concat_axis,
++                    physical_to_logical_map=wm.physical_to_logical_map,
++                )
++
++        if not is_static:
++            add_linear(
++                f"{src}.mlp.shared_expert.gate_proj",
++                f"{dst}.mlp.shared_experts.gate_proj",
++                (None, "tensor"),
++            )
++            add_linear(
++                f"{src}.mlp.shared_expert.up_proj",
++                f"{dst}.mlp.shared_experts.up_proj",
++                (None, "tensor"),
++            )
++            add_linear(
++                f"{src}.mlp.shared_expert.down_proj",
++                f"{dst}.mlp.shared_experts.down_proj",
++                ("tensor", None),
++            )
++        else:
++            # Static fp8 shared experts are narrow-N for gate/up (out=1024 ->
++            # per-TP N=128 == block_n) which the block kernel rejects; dequant
++            # all three to bf16 manually. Markers keep coverage happy.
++            for pj in ("gate_proj", "up_proj", "down_proj"):
++                mappings[f"{src}.mlp.shared_expert.{pj}.weight"] = WeightMapping(
++                    target_path=f"__SHEXP_{pj.upper()}_WEIGHT__{i}",
++                    sharding=(None, None),
++                    transpose=False,
++                )
++                mappings[f"{src}.mlp.shared_expert.{pj}.weight_scale_inv"] = WeightMapping(
++                    target_path=f"__SHEXP_{pj.upper()}_SCALE__{i}",
++                    sharding=(None, None),
++                    transpose=False,
++                )
+         mappings[f"{src}.mlp.shared_expert_gate.weight"] = WeightMapping(
+             target_path=f"{dst}.mlp.shared_expert_gate.weight",
+             sharding=(None, None),
+diff --git a/python/sgl_jax/srt/utils/quantization/configs/fp8_qwen3_5.yaml b/python/sgl_jax/srt/utils/quantization/configs/fp8_qwen3_5.yaml
+new file mode 100644
+index 0000000..f71ec8d
+--- /dev/null
++++ b/python/sgl_jax/srt/utils/quantization/configs/fp8_qwen3_5.yaml
+@@ -0,0 +1,41 @@
++# FP8 (block-wise 128x128) config for Qwen3.5-MoE (e.g. Qwen3.5-397B-A17B-FP8).
++#
++# Static offline checkpoint: weights are pre-quantized fp8_e4m3fn + block
++# weight_scale_inv sidecars. We only allocate the fp8 param structure and load
++# the scales; no online (re)quantization happens.
++#
++# Quantize ONLY:
++#   * full-attention self_attn.{q,o}_proj
++#   * MoE routed experts (handled via the moe section below)
++# Keep BF16 (excluded by the linear regex / not MoE, dequant'd manually):
++#   * self_attn.{k,v}_proj  -> only 2 KV heads -> at TP=8 the block scale
++#     ([out/128=4, in/128]) cannot shard on 'tensor' and needs GQA block
++#     replication; the model loader dequantizes them to bf16 manually instead.
++#   * MoE shared_expert.{gate,up,down}_proj -> gate/up have out=1024 -> per-TP
++#     N=128 == block_n=128, which the block-wise fp8 kernel rejects
++#     (narrow-N accuracy collapse). Dequantized to bf16 manually.
++#   * moe_gate (router), shared_expert_gate
++#   * GDN linear_attn projections (in_proj_qkvz/in_proj_ba/conv1d/out_proj) and
++#     norms/A_log/dt_bias  -> per checkpoint modules_to_not_convert (dequant'd
++#     manually to bf16 for the fp8 sidecars)
++#   * embed_tokens, lm_head, logits_processor, all layernorms/q_norm/k_norm
++#
++# NOTE: apply_linear_quantization matches these regexes against the model-walk
++# path which uses '/' separators and bracketed list indices, e.g.
++# "language_model/model/layers[3]/self_attn/q_proj". The positive lookahead
++# below only fires for full-attention q_proj / o_proj.
++
++quantization:
++  is_static_checkpoint: true
++  weight_block_size: [128, 128]
++
++  linear:
++    rules:
++      - module_path: '^(?=.*/self_attn/(q_proj|o_proj)$).*$'
++        weight_dtype: 'float8_e4m3fn'
++        activation_dtype: null
++
++  # MoE routed experts: FP8 weights only, no activation quantization.
++  moe:
++    weight_dtype: 'float8_e4m3fn'
++    activation_dtype: null

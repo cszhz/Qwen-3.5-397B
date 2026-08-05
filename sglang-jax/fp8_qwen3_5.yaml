@@ -1,0 +1,41 @@
+# FP8 (block-wise 128x128) config for Qwen3.5-MoE (e.g. Qwen3.5-397B-A17B-FP8).
+#
+# Static offline checkpoint: weights are pre-quantized fp8_e4m3fn + block
+# weight_scale_inv sidecars. We only allocate the fp8 param structure and load
+# the scales; no online (re)quantization happens.
+#
+# Quantize ONLY:
+#   * full-attention self_attn.{q,o}_proj
+#   * MoE routed experts (handled via the moe section below)
+# Keep BF16 (excluded by the linear regex / not MoE, dequant'd manually):
+#   * self_attn.{k,v}_proj  -> only 2 KV heads -> at TP=8 the block scale
+#     ([out/128=4, in/128]) cannot shard on 'tensor' and needs GQA block
+#     replication; the model loader dequantizes them to bf16 manually instead.
+#   * MoE shared_expert.{gate,up,down}_proj -> gate/up have out=1024 -> per-TP
+#     N=128 == block_n=128, which the block-wise fp8 kernel rejects
+#     (narrow-N accuracy collapse). Dequantized to bf16 manually.
+#   * moe_gate (router), shared_expert_gate
+#   * GDN linear_attn projections (in_proj_qkvz/in_proj_ba/conv1d/out_proj) and
+#     norms/A_log/dt_bias  -> per checkpoint modules_to_not_convert (dequant'd
+#     manually to bf16 for the fp8 sidecars)
+#   * embed_tokens, lm_head, logits_processor, all layernorms/q_norm/k_norm
+#
+# NOTE: apply_linear_quantization matches these regexes against the model-walk
+# path which uses '/' separators and bracketed list indices, e.g.
+# "language_model/model/layers[3]/self_attn/q_proj". The positive lookahead
+# below only fires for full-attention q_proj / o_proj.
+
+quantization:
+  is_static_checkpoint: true
+  weight_block_size: [128, 128]
+
+  linear:
+    rules:
+      - module_path: '^(?=.*/self_attn/(q_proj|o_proj)$).*$'
+        weight_dtype: 'float8_e4m3fn'
+        activation_dtype: null
+
+  # MoE routed experts: FP8 weights only, no activation quantization.
+  moe:
+    weight_dtype: 'float8_e4m3fn'
+    activation_dtype: null
